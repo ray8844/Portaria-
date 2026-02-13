@@ -37,19 +37,24 @@ const App: React.FC = () => {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle');
 
-  // Sincronização automática a cada 20 minutos ou no login
+  // Sincronização inicial e periódica
   useEffect(() => {
     const runAutoSync = async () => {
       if (!isAuthenticated || !supabaseSession || !navigator.onLine) return;
       await syncService.syncAllModules(setSyncStatus);
       
-      // Limpa status de sucesso/erro após 8 segundos para não poluir
-      setTimeout(() => setSyncStatus('idle'), 8000);
+      // Atualiza o estado local das configurações caso o sync tenha trazido novos contatos
+      setSettings(db.getSettings());
+      
+      setTimeout(() => setSyncStatus('idle'), 5000);
     };
     
-    if (isAuthenticated && supabaseSession) runAutoSync();
+    // Dispara Sync sempre que o usuário logar operacionalmente
+    if (isAuthenticated && supabaseSession) {
+      runAutoSync();
+    }
     
-    const interval = setInterval(runAutoSync, 20 * 60 * 1000);
+    const interval = setInterval(runAutoSync, 15 * 60 * 1000); // 15 min
     return () => clearInterval(interval);
   }, [supabaseSession, isAuthenticated]);
 
@@ -120,19 +125,20 @@ const App: React.FC = () => {
       <main className="flex-1 overflow-y-auto pb-24">
         {(() => {
           const isAdmin = internalUser?.role === 'admin';
+          const currentSettings = db.getSettings(); // Garante que as views recebam a versão mais atual do DB
           switch (currentView) {
             case 'DASHBOARD': return <Dashboard onNewArrival={() => setCurrentView('NEW_ENTRY')} activeCount={entries.filter(e => e.entryTime && !e.exitTime).length} onViewActive={() => setCurrentView('ACTIVE_LIST')} onViewShift={() => setCurrentView('SHIFT_MANAGER')} onViewMasterData={() => isAdmin ? setCurrentView('MASTER_DATA') : undefined} onViewContacts={() => setCurrentView('CONTACTS')} onViewBreakfast={() => setCurrentView('BREAKFAST')} onViewPackages={() => setCurrentView('PACKAGES')} onViewMeters={() => setCurrentView('METERS')} onViewLogs={() => isAdmin ? setCurrentView('SYSTEM_LOGS') : undefined} onViewPatrols={() => setCurrentView('PATROLS')} userRole={internalUser?.role} />;
             case 'PATROLS': return <PatrolManager onBack={() => setCurrentView('DASHBOARD')} operatorName={internalUser?.username || ''} />;
             case 'METERS': return <MeterManager onBack={() => setCurrentView('DASHBOARD')} operatorName={internalUser?.username || ''} />;
             case 'PACKAGES': return <PackageManager onBack={() => setCurrentView('DASHBOARD')} operatorName={internalUser?.username || ''} />;
             case 'BREAKFAST': return <BreakfastManager onBack={() => setCurrentView('DASHBOARD')} operatorName={internalUser?.username || ''} />;
-            case 'CONTACTS': return <ContactManagement settings={settings} onSave={(s) => { db.saveSettings(s); setSettings(s); setCurrentView('DASHBOARD'); }} onBack={() => setCurrentView('DASHBOARD')} userRole={internalUser?.role} />;
+            case 'CONTACTS': return <ContactManagement settings={currentSettings} onSave={(s) => { db.saveSettings(s); setSettings(s); setCurrentView('DASHBOARD'); }} onBack={() => setCurrentView('DASHBOARD')} userRole={internalUser?.role} />;
             case 'MASTER_DATA': return <DataManagement onBack={() => setCurrentView('DASHBOARD')} />;
             case 'SHIFT_MANAGER': return <WorkShiftManager onBack={() => setCurrentView('DASHBOARD')} operatorName={internalUser?.username || ''} />;
-            case 'NEW_ENTRY': return <NewEntryFlow settings={settings} operatorName={internalUser?.username || ''} onComplete={() => { refreshEntries(); setCurrentView('DASHBOARD'); }} onCancel={() => setCurrentView('DASHBOARD')} />;
+            case 'NEW_ENTRY': return <NewEntryFlow settings={currentSettings} operatorName={internalUser?.username || ''} onComplete={() => { refreshEntries(); setCurrentView('DASHBOARD'); }} onCancel={() => setCurrentView('DASHBOARD')} />;
             case 'ACTIVE_LIST': return <ActiveVehicles entries={entries.filter(e => e.entryTime && !e.exitTime)} onUpdate={refreshEntries} onBack={() => setCurrentView('DASHBOARD')} />;
             case 'REPORTS': return <Reports entries={entries} onBack={() => setCurrentView('DASHBOARD')} onUpdate={refreshEntries} />;
-            case 'SETTINGS': return <Settings settings={settings} onSave={(s) => { db.saveSettings(s); setSettings(s); setCurrentView('DASHBOARD'); }} onBack={() => setCurrentView('DASHBOARD')} onManageUsers={() => setCurrentView('USER_MANAGEMENT')} onSwitchUserRequest={logoutInternal} onLogoutRequest={signOut} />;
+            case 'SETTINGS': return <Settings settings={currentSettings} onSave={(s) => { db.saveSettings(s); setSettings(s); setCurrentView('DASHBOARD'); }} onBack={() => setCurrentView('DASHBOARD')} onManageUsers={() => setCurrentView('USER_MANAGEMENT')} onSwitchUserRequest={logoutInternal} onLogoutRequest={signOut} />;
             case 'USER_MANAGEMENT': return <UserManagement onBack={() => setCurrentView('DASHBOARD')} />;
             default: return null;
           }
