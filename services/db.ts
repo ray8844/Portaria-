@@ -15,11 +15,6 @@ interface DeletedItem {
   timestamp: string;
 }
 
-/**
- * DATABASE SERVICE (Offline-First)
- * Gerencia todos os dados usando LocalStorage com logs de auditoria e flags de sincronização.
- */
-
 const generateUUID = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -28,9 +23,44 @@ const generateUUID = () => {
 };
 
 export const db = {
-  // --- AUXILIARES DE SINCRONIZAÇÃO ---
+  // --- AUXILIARES DE SINCRONIZAÇÃO BIDIRECIONAL ---
   
-  // Adiciona item à fila de exclusão para sincronizar depois
+  // Mescla dados vindos da nuvem com os locais sem duplicar
+  upsertFromCloud: <T extends { id: string, synced?: boolean }>(key: string, cloudItems: T[]) => {
+    try {
+      const localDataStr = localStorage.getItem(key);
+      let localList: T[] = localDataStr ? JSON.parse(localDataStr) : [];
+      const localIds = new Set(localList.map(item => item.id));
+      
+      let addedCount = 0;
+      let updatedCount = 0;
+
+      cloudItems.forEach(cloudItem => {
+        const itemToStore = { ...cloudItem, synced: true };
+        if (localIds.has(cloudItem.id)) {
+          // Se já existe, atualizamos se o local estiver marcado como sincronizado
+          // (Para não sobrescrever mudanças locais pendentes de envio)
+          const index = localList.findIndex(i => i.id === cloudItem.id);
+          if (localList[index].synced) {
+            localList[index] = itemToStore;
+            updatedCount++;
+          }
+        } else {
+          localList.push(itemToStore);
+          addedCount++;
+        }
+      });
+
+      if (addedCount > 0 || updatedCount > 0) {
+        localStorage.setItem(key, JSON.stringify(localList));
+      }
+      return { added: addedCount, updated: updatedCount };
+    } catch (e) {
+      console.error(`Erro ao fazer upsert cloud em ${key}`, e);
+      return { added: 0, updated: 0 };
+    }
+  },
+
   markForDeletion: (id: string, table: string) => {
     const queue: DeletedItem[] = JSON.parse(localStorage.getItem(DELETED_QUEUE_KEY) || '[]');
     queue.push({ id, table, timestamp: new Date().toISOString() });
@@ -47,7 +77,6 @@ export const db = {
     localStorage.setItem(DELETED_QUEUE_KEY, JSON.stringify(queue));
   },
 
-  // Marca múltiplos itens como sincronizados localmente
   markAsSynced: (key: string, ids: string[]) => {
     try {
       const dataStr = localStorage.getItem(key);
@@ -65,7 +94,6 @@ export const db = {
     }
   },
 
-  // Busca itens pendentes de sincronização
   getUnsyncedItems: <T>(key: string): T[] => {
     try {
       const dataStr = localStorage.getItem(key);
@@ -89,7 +117,7 @@ export const db = {
     localStorage.removeItem(STORAGE_KEYS.SESSION);
   },
 
-  // --- LOGS DO SISTEMA ---
+  // --- LOGS ---
   getLogs: (): AppLog[] => {
     const data = localStorage.getItem(STORAGE_KEYS.LOGS);
     return data ? JSON.parse(data) : [];
@@ -98,7 +126,6 @@ export const db = {
     try {
       localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(logs));
     } catch (e) {
-      console.warn("Limite de logs atingido, limpando antigos...");
       localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(logs.slice(-500)));
     }
   },
@@ -148,11 +175,7 @@ export const db = {
     const list = db.getPatrols();
     const index = list.findIndex(p => p.id === updated.id);
     if (index !== -1) {
-      list[index] = {
-        ...updated,
-        synced: false,
-        updated_at: new Date().toISOString()
-      };
+      list[index] = { ...updated, synced: false, updated_at: new Date().toISOString() };
       db.savePatrols(list);
       if (updated.status === 'CONCLUIDA') {
         db.addLog('Rondas', 'Finalizou ronda', updated.id, `Duração: ${updated.duracaoMinutos} min`);
@@ -161,9 +184,8 @@ export const db = {
   },
   deletePatrol: (id: string) => {
     const list = db.getPatrols();
-    const filtered = list.filter(p => p.id !== id);
-    db.savePatrols(filtered);
-    db.markForDeletion(id, 'patrols'); // Marca para exclusão no Supabase
+    db.savePatrols(list.filter(p => p.id !== id));
+    db.markForDeletion(id, 'patrols');
     db.addLog('Rondas', 'Excluiu registro de ronda', id);
   },
 
@@ -185,47 +207,20 @@ export const db = {
         logs: db.getLogs()
       }
     };
-    db.addLog('Sistema', 'Exportação de Backup', undefined, `Backup total gerado.`);
     return JSON.stringify(payload);
   },
 
   importCompleteBackup: (jsonStr: string) => {
-    try {
-      const payload: ShiftBackupPayload = JSON.parse(jsonStr);
-      
-      if (!payload || payload.versao !== "1.0" || !payload.dados) {
-        throw new Error("O arquivo selecionado não é um backup válido.");
-      }
-
-      const currentLogs = db.getLogs();
-      const importedLogs = payload.dados.logs || [];
-
-      // Ao importar backup, marcamos tudo como unsynced para garantir que suba para a nuvem se necessário
-      // Ou mantemos o estado original? Para evitar duplicidade no Supabase, idealmente manteríamos os IDs.
-      // Vamos manter os dados como estão. O sync vai lidar com upsert.
-
-      try {
-        localStorage.setItem(STORAGE_KEYS.BREAKFAST, JSON.stringify(payload.dados.cafe || []));
-        localStorage.setItem(STORAGE_KEYS.PACKAGES, JSON.stringify(payload.dados.encomendas || []));
-        localStorage.setItem(STORAGE_KEYS.ENTRIES, JSON.stringify(payload.dados.entradas || []));
-        localStorage.setItem(STORAGE_KEYS.METERS, JSON.stringify(payload.dados.medidores || []));
-        localStorage.setItem(STORAGE_KEYS.METER_READINGS, JSON.stringify(payload.dados.leituras || []));
-        localStorage.setItem(STORAGE_KEYS.SHIFTS, JSON.stringify(payload.dados.expediente || []));
-        localStorage.setItem(STORAGE_KEYS.PATROLS, JSON.stringify(payload.dados.rondas || []));
-        
-        const unifiedLogs = [...currentLogs, ...importedLogs].slice(-2000);
-        localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(unifiedLogs));
-        
-        db.addLog('Sistema', 'Importação de Backup', undefined, `Backup de ${payload.geradoPor} restaurado.`);
-      } catch (storageError) {
-        throw new Error("Espaço insuficiente no dispositivo.");
-      }
-
-      return true;
-    } catch (e: any) {
-      console.error("Erro na restauração:", e);
-      throw e;
-    }
+    const payload: ShiftBackupPayload = JSON.parse(jsonStr);
+    localStorage.setItem(STORAGE_KEYS.BREAKFAST, JSON.stringify(payload.dados.cafe || []));
+    localStorage.setItem(STORAGE_KEYS.PACKAGES, JSON.stringify(payload.dados.encomendas || []));
+    localStorage.setItem(STORAGE_KEYS.ENTRIES, JSON.stringify(payload.dados.entradas || []));
+    localStorage.setItem(STORAGE_KEYS.METERS, JSON.stringify(payload.dados.medidores || []));
+    localStorage.setItem(STORAGE_KEYS.METER_READINGS, JSON.stringify(payload.dados.leituras || []));
+    localStorage.setItem(STORAGE_KEYS.SHIFTS, JSON.stringify(payload.dados.expediente || []));
+    localStorage.setItem(STORAGE_KEYS.PATROLS, JSON.stringify(payload.dados.rondas || []));
+    db.addLog('Sistema', 'Importação de Backup Total');
+    return true;
   },
 
   // --- MEDIDORES ---
@@ -238,9 +233,6 @@ export const db = {
   },
   addMeter: (meter: Meter) => {
     const list = db.getMeters();
-    if (list.some(m => m.name.toLowerCase() === meter.name.toLowerCase())) {
-      throw new Error("Já existe um medidor com este nome.");
-    }
     const now = new Date().toISOString();
     const newMeter = {
       ...meter,
@@ -251,15 +243,12 @@ export const db = {
     };
     list.push(newMeter);
     db.saveMeters(list);
-    db.addLog('Medidores', 'Novo Medidor Cadastrado', newMeter.id, newMeter.name);
+    db.addLog('Medidores', 'Novo Medidor', newMeter.id, newMeter.name);
   },
   deleteMeter: (id: string) => {
     const list = db.getMeters();
-    const meter = list.find(m => m.id === id);
-    const filtered = list.filter(m => m.id !== id);
-    db.saveMeters(filtered);
+    db.saveMeters(list.filter(m => m.id !== id));
     db.markForDeletion(id, 'meters');
-    db.addLog('Medidores', 'Medidor Excluído', id, meter?.name);
   },
 
   // --- LEITURAS ---
@@ -282,7 +271,7 @@ export const db = {
     };
     list.push(newReading);
     db.saveReadings(list);
-    db.addLog('Medidores', 'Nova Leitura', newReading.meterId, `Valor: ${newReading.value}`);
+    db.addLog('Medidores', 'Nova Leitura', newReading.meterId);
   },
   getReadingsByMeter: (meterId: string): MeterReading[] => {
     return db.getReadings().filter(r => r.meterId === meterId).sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
@@ -306,7 +295,6 @@ export const db = {
       list[index].synced = false;
       list[index].updated_at = new Date().toISOString();
       db.saveBreakfastList(list);
-      db.addLog('Café', 'Confirmou entrega', id, list[index].personName);
     }
   },
   addBreakfastPerson: (person: BreakfastRecord) => {
@@ -321,22 +309,12 @@ export const db = {
     };
     list.push(newPerson);
     db.saveBreakfastList(list);
-    db.addLog('Café', 'Adicionou pessoa à lista', newPerson.id, newPerson.personName);
   },
   clearBreakfastByDate: (date: string) => {
-    // Aqui é um "Soft Delete" ou exclusão em massa?
-    // Se o usuário quer limpar a lista, vamos marcar para exclusão.
     const list = db.getBreakfastList();
     const toRemove = list.filter(item => item.date === date);
-    const filtered = list.filter(item => item.date !== date);
-    
-    db.saveBreakfastList(filtered);
-    
-    toRemove.forEach(item => {
-      db.markForDeletion(item.id, 'breakfast_list');
-    });
-    
-    db.addLog('Café', 'Limpou lista do dia', undefined, `Data: ${date}`);
+    db.saveBreakfastList(list.filter(item => item.date !== date));
+    toRemove.forEach(item => db.markForDeletion(item.id, 'breakfast_list'));
   },
 
   // --- ENCOMENDAS ---
@@ -350,53 +328,28 @@ export const db = {
   addPackage: (record: PackageRecord) => {
     const list = db.getPackages();
     const now = new Date().toISOString();
-    const newPkg = {
-      ...record,
-      id: record.id || generateUUID(),
-      synced: false,
-      created_at: record.created_at || now,
-      updated_at: now
-    };
+    const newPkg = { ...record, id: record.id || generateUUID(), synced: false, created_at: now, updated_at: now };
     list.push(newPkg);
     db.savePackages(list);
-    db.addLog('Encomendas', 'Registrou nova encomenda', newPkg.id, `De: ${newPkg.deliveryCompany} Para: ${newPkg.recipientName}`);
   },
   updatePackage: (updated: PackageRecord) => {
     const list = db.getPackages();
     const index = list.findIndex(p => p.id === updated.id);
     if (index !== -1) {
-      const old = list[index];
-      list[index] = {
-        ...updated,
-        synced: false,
-        updated_at: new Date().toISOString()
-      };
+      list[index] = { ...updated, synced: false, updated_at: new Date().toISOString() };
       db.savePackages(list);
-      
-      if (old.status !== updated.status && updated.status === 'Entregue') {
-        db.addLog('Encomendas', 'Marcou como entregue', updated.id, `Retirado por ${updated.deliveredTo}`);
-      } else {
-        db.addLog('Encomendas', 'Alterou registro', updated.id);
-      }
     }
   },
   deletePackage: (id: string) => {
     const list = db.getPackages();
-    const record = list.find(p => p.id === id);
-    const filtered = list.filter(p => p.id !== id);
-    db.savePackages(filtered);
+    db.savePackages(list.filter(p => p.id !== id));
     db.markForDeletion(id, 'packages');
-    db.addLog('Encomendas', 'Excluiu registro', id, record?.recipientName);
   },
 
-  // --- PORTARIA / ENTRADAS ---
+  // --- PORTARIA ---
   getEntries: (): VehicleEntry[] => {
-    try {
-      const data = localStorage.getItem(STORAGE_KEYS.ENTRIES);
-      return data ? JSON.parse(data) : [];
-    } catch (e) {
-      return [];
-    }
+    const data = localStorage.getItem(STORAGE_KEYS.ENTRIES);
+    return data ? JSON.parse(data) : [];
   },
   saveEntries: (entries: VehicleEntry[]) => {
     localStorage.setItem(STORAGE_KEYS.ENTRIES, JSON.stringify(entries));
@@ -404,80 +357,36 @@ export const db = {
   addEntry: (entry: VehicleEntry) => {
     const entries = db.getEntries();
     const now = new Date().toISOString();
-    const newEntry = {
-      ...entry,
-      id: entry.id || generateUUID(),
-      synced: false,
-      created_at: entry.created_at || now,
-      updated_at: now
-    };
-
-    if (!entries.find(e => e.id === newEntry.id)) {
-      entries.push(newEntry);
-      db.saveEntries(entries);
-      db.addLog('Portaria', 'Nova entrada registrada', newEntry.id, `${newEntry.driverName} - ${newEntry.vehiclePlate || 'A pé'}`);
-    }
+    const newEntry = { ...entry, id: entry.id || generateUUID(), synced: false, created_at: now, updated_at: now };
+    entries.push(newEntry);
+    db.saveEntries(entries);
   },
   updateEntry: (updatedEntry: VehicleEntry) => {
     const entries = db.getEntries();
     const index = entries.findIndex(e => e.id === updatedEntry.id);
     if (index !== -1) {
-      const old = entries[index];
-      entries[index] = {
-        ...updatedEntry,
-        synced: false,
-        updated_at: new Date().toISOString()
-      };
+      entries[index] = { ...updatedEntry, synced: false, updated_at: new Date().toISOString() };
       db.saveEntries(entries);
-      
-      let details = "";
-      if (old.status !== updatedEntry.status) details += `Status: ${old.status} -> ${updatedEntry.status}. `;
-      db.addLog('Portaria', 'Registro Alterado', updatedEntry.id, details || `Alteração em ${updatedEntry.driverName}`);
     }
   },
 
-  // Exclusão de Perfil: Remove todos os registros associados localmente
-  // Para sincronizar, precisa marcar TODOS eles para exclusão
   deleteProfileEntries: (name: string, plate: string) => {
     const entries = db.getEntries();
-    const toRemove = entries.filter(e => 
-      e.driverName.toLowerCase() === name.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === plate.toLowerCase()
-    );
-    
-    const filtered = entries.filter(e => 
-      !(e.driverName.toLowerCase() === name.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === plate.toLowerCase())
-    );
-    
-    db.saveEntries(filtered);
-    
-    toRemove.forEach(e => {
-      db.markForDeletion(e.id, 'vehicle_entries');
-    });
-
-    db.addLog('Portaria', 'Exclusão de Perfil', undefined, `Perfil ${name} (${plate || 'S/P'}) removido.`);
+    const toRemove = entries.filter(e => e.driverName.toLowerCase() === name.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === plate.toLowerCase());
+    db.saveEntries(entries.filter(e => !(e.driverName.toLowerCase() === name.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === plate.toLowerCase())));
+    toRemove.forEach(e => db.markForDeletion(e.id, 'vehicle_entries'));
   },
 
   updateProfileEntries: (oldName: string, oldPlate: string, updates: Partial<VehicleEntry>) => {
     const entries = db.getEntries();
-    let count = 0;
     const now = new Date().toISOString();
-
     const updated = entries.map(e => {
-      const matchName = e.driverName.toLowerCase() === oldName.toLowerCase();
-      const matchPlate = (e.vehiclePlate || '').toLowerCase() === oldPlate.toLowerCase();
-      if (matchName && matchPlate) {
-        count++;
-        return { 
-          ...e, 
-          ...updates, 
-          synced: false, 
-          updated_at: now 
-        };
+      if (e.driverName.toLowerCase() === oldName.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === oldPlate.toLowerCase()) {
+        return { ...e, ...updates, synced: false, updated_at: now };
       }
       return e;
     });
     db.saveEntries(updated);
-    db.addLog('Portaria', 'Edição de Perfil', undefined, `Perfil ${oldName} (${oldPlate || 'S/P'}) atualizado em ${count} registros.`);
   },
 
   // --- PONTO ---
@@ -492,67 +401,36 @@ export const db = {
     const shifts = db.getShifts();
     const now = new Date().toISOString();
     const index = shifts.findIndex(s => s.id === updatedShift.id);
-    
     if (index !== -1) {
       shifts[index] = { ...updatedShift, synced: false, updated_at: now };
     } else {
-      shifts.push({ 
-        ...updatedShift, 
-        id: updatedShift.id || generateUUID(),
-        synced: false, 
-        created_at: now, 
-        updated_at: now 
-      });
+      shifts.push({ ...updatedShift, id: updatedShift.id || generateUUID(), synced: false, created_at: now, updated_at: now });
     }
     db.saveShifts(shifts);
-    db.addLog('Ponto', 'Registro de Horário', updatedShift.id, `Operador: ${updatedShift.operatorName}`);
   },
 
   importEntries: (newEntries: VehicleEntry[], origin: ImportOrigin): number => {
     const currentEntries = db.getEntries();
     const currentIds = new Set(currentEntries.map(e => e.id));
     const now = new Date().toISOString();
-    
-    let addedCount = 0;
-    const toAdd = newEntries.filter(e => !currentIds.has(e.id)).map(e => ({
-      ...e, 
-      id: e.id || generateUUID(),
-      origin: origin, 
-      lastSyncAt: now,
-      synced: false,
-      created_at: now,
-      updated_at: now
-    }));
-    
+    const toAdd = newEntries.filter(e => !currentIds.has(e.id)).map(e => ({ ...e, id: e.id || generateUUID(), origin, synced: false, created_at: now, updated_at: now }));
     if (toAdd.length > 0) {
       db.saveEntries([...currentEntries, ...toAdd]);
-      addedCount = toAdd.length;
-      db.addLog('Portaria', 'Importação de Registros', undefined, `${addedCount} novos registros unidos.`);
     }
-    return addedCount;
+    return toAdd.length;
   },
   
   getSettings: (): AppSettings => {
     const data = localStorage.getItem(STORAGE_KEYS.SETTINGS);
     const defaults: AppSettings = {
-      sectorContacts: [
-        { id: '1', name: 'Logística', number: '5500000000000' },
-        { id: '2', name: 'Almoxarifado', number: '5500000000000' }
-      ],
-      companyName: 'Portaria PX',
-      deviceName: 'Estação Principal',
-      theme: 'light',
-      fontSize: 'medium',
-      synced: true // Default true para evitar sync inicial desnecessário sem mudanças
+      sectorContacts: [{ id: '1', name: 'Logística', number: '5500000000000' }, { id: '2', name: 'Almoxarifado', number: '5500000000000' }],
+      companyName: 'Portaria PX', deviceName: 'Estação Principal', theme: 'light', fontSize: 'medium', synced: true
     };
     return data ? JSON.parse(data) : defaults;
   },
   
   saveSettings: (settings: AppSettings) => {
-    // Ao salvar configurações, marca como não sincronizado
-    const toSave = { ...settings, synced: false, updated_at: new Date().toISOString() };
-    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(toSave));
-    db.addLog('Sistema', 'Alteração de Configurações');
+    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify({ ...settings, synced: false, updated_at: new Date().toISOString() }));
   },
   
   getDraft: () => {
