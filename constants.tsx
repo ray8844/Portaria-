@@ -15,7 +15,8 @@ export const STORAGE_KEYS = {
   METERS: 'portaria_express_meters',
   METER_READINGS: 'portaria_express_meter_readings',
   LOGS: 'portaria_express_logs',
-  PATROLS: 'portaria_express_patrols'
+  PATROLS: 'portaria_express_patrols',
+  USERS_CACHE: 'portaria_express_users_cache'
 };
 
 export const Icons = {

@@ -2,16 +2,16 @@
 import { 
   VehicleEntry, AppSettings, UserSession, ImportOrigin, 
   WorkShift, BreakfastRecord, PackageRecord, Meter, 
-  MeterReading, ShiftBackupPayload, AppLog, PatrolRecord 
+  MeterReading, ShiftBackupPayload, AppLog, PatrolRecord, InternalUser 
 } from '../types';
 import { STORAGE_KEYS } from '../constants';
 
-// Chave para fila de exclusão
 const DELETED_QUEUE_KEY = 'portaria_express_deleted_queue';
+const SESSION_KEY = 'portaria_express_active_session_v2';
 
 interface DeletedItem {
   id: string;
-  table: string; // nome da tabela no Supabase
+  table: string; 
   timestamp: string;
 }
 
@@ -23,9 +23,28 @@ const generateUUID = () => {
 };
 
 export const db = {
-  // --- AUXILIARES DE SINCRONIZAÇÃO BIDIRECIONAL ---
-  
-  // Mescla dados vindos da nuvem com os locais sem duplicar
+  // --- CACHE DE USUÁRIOS INTERNOS ---
+  getUsersCache: (): InternalUser[] => {
+    try {
+      const data = localStorage.getItem(STORAGE_KEYS.USERS_CACHE);
+      return data ? JSON.parse(data) : [];
+    } catch { return []; }
+  },
+  saveUsersCache: (users: InternalUser[]) => {
+    localStorage.setItem(STORAGE_KEYS.USERS_CACHE, JSON.stringify(users));
+  },
+  updateUserInCache: (user: InternalUser) => {
+    const cache = db.getUsersCache();
+    const index = cache.findIndex(u => u.id === user.id);
+    if (index !== -1) {
+      cache[index] = user;
+    } else {
+      cache.push(user);
+    }
+    db.saveUsersCache(cache);
+  },
+
+  // --- SINCRONIZAÇÃO CORE ---
   upsertFromCloud: <T extends { id: string, synced?: boolean }>(key: string, cloudItems: T[]) => {
     try {
       const localDataStr = localStorage.getItem(key);
@@ -38,9 +57,8 @@ export const db = {
       cloudItems.forEach(cloudItem => {
         const itemToStore = { ...cloudItem, synced: true };
         if (localIds.has(cloudItem.id)) {
-          // Se já existe, atualizamos se o local estiver marcado como sincronizado
-          // (Para não sobrescrever mudanças locais pendentes de envio)
           const index = localList.findIndex(i => i.id === cloudItem.id);
+          // Só atualiza se o local estiver sincronizado (evita sobrescrever alterações locais pendentes)
           if (localList[index].synced) {
             localList[index] = itemToStore;
             updatedCount++;
@@ -56,7 +74,7 @@ export const db = {
       }
       return { added: addedCount, updated: updatedCount };
     } catch (e) {
-      console.error(`Erro ao fazer upsert cloud em ${key}`, e);
+      console.error(`Erro no upsert cloud: ${key}`, e);
       return { added: 0, updated: 0 };
     }
   },
@@ -105,10 +123,11 @@ export const db = {
     }
   },
 
-  // --- GESTÃO DE SESSÃO ---
+  // --- SESSÃO ---
   getSession: (): UserSession | null => {
+    const active = sessionStorage.getItem(SESSION_KEY); 
     const data = localStorage.getItem(STORAGE_KEYS.SESSION);
-    return data ? JSON.parse(data) : null;
+    return active ? { operatorName: JSON.parse(active).username, loginTime: '' } : (data ? JSON.parse(data) : null);
   },
   saveSession: (session: UserSession) => {
     localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(session));
@@ -123,11 +142,7 @@ export const db = {
     return data ? JSON.parse(data) : [];
   },
   saveLogs: (logs: AppLog[]) => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(logs));
-    } catch (e) {
-      localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(logs.slice(-500)));
-    }
+    localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(logs.slice(-2000)));
   },
   addLog: (module: AppLog['module'], action: string, refId?: string, details?: string) => {
     const logs = db.getLogs();
@@ -136,7 +151,7 @@ export const db = {
     const newLog: AppLog = {
       id: generateUUID(),
       timestamp: now,
-      user: session?.operatorName || "Desconhecido",
+      user: session?.operatorName || "Sistema",
       module,
       action,
       referenceId: refId,
@@ -146,7 +161,7 @@ export const db = {
       updated_at: now
     };
     logs.push(newLog);
-    db.saveLogs(logs.slice(-2000));
+    db.saveLogs(logs);
   },
 
   // --- RONDAS ---
@@ -164,12 +179,11 @@ export const db = {
       ...patrol,
       id: patrol.id || generateUUID(),
       synced: false,
-      created_at: patrol.created_at || now,
+      createdAt: now,
       updated_at: now
     };
     list.push(newPatrol);
     db.savePatrols(list);
-    db.addLog('Rondas', 'Iniciou nova ronda', newPatrol.id, `Porteiro: ${newPatrol.porteiro}`);
   },
   updatePatrol: (updated: PatrolRecord) => {
     const list = db.getPatrols();
@@ -177,50 +191,12 @@ export const db = {
     if (index !== -1) {
       list[index] = { ...updated, synced: false, updated_at: new Date().toISOString() };
       db.savePatrols(list);
-      if (updated.status === 'CONCLUIDA') {
-        db.addLog('Rondas', 'Finalizou ronda', updated.id, `Duração: ${updated.duracaoMinutos} min`);
-      }
     }
   },
   deletePatrol: (id: string) => {
     const list = db.getPatrols();
     db.savePatrols(list.filter(p => p.id !== id));
     db.markForDeletion(id, 'patrols');
-    db.addLog('Rondas', 'Excluiu registro de ronda', id);
-  },
-
-  // --- BACKUP ---
-  exportCompleteBackup: (): string => {
-    const session = db.getSession();
-    const payload: ShiftBackupPayload = {
-      versao: "1.0",
-      dataExportacao: new Date().toISOString(),
-      geradoPor: session?.operatorName || "Porteiro",
-      dados: {
-        cafe: db.getBreakfastList(),
-        encomendas: db.getPackages(),
-        entradas: db.getEntries(),
-        medidores: db.getMeters(),
-        leituras: db.getReadings(),
-        expediente: db.getShifts(),
-        rondas: db.getPatrols(),
-        logs: db.getLogs()
-      }
-    };
-    return JSON.stringify(payload);
-  },
-
-  importCompleteBackup: (jsonStr: string) => {
-    const payload: ShiftBackupPayload = JSON.parse(jsonStr);
-    localStorage.setItem(STORAGE_KEYS.BREAKFAST, JSON.stringify(payload.dados.cafe || []));
-    localStorage.setItem(STORAGE_KEYS.PACKAGES, JSON.stringify(payload.dados.encomendas || []));
-    localStorage.setItem(STORAGE_KEYS.ENTRIES, JSON.stringify(payload.dados.entradas || []));
-    localStorage.setItem(STORAGE_KEYS.METERS, JSON.stringify(payload.dados.medidores || []));
-    localStorage.setItem(STORAGE_KEYS.METER_READINGS, JSON.stringify(payload.dados.leituras || []));
-    localStorage.setItem(STORAGE_KEYS.SHIFTS, JSON.stringify(payload.dados.expediente || []));
-    localStorage.setItem(STORAGE_KEYS.PATROLS, JSON.stringify(payload.dados.rondas || []));
-    db.addLog('Sistema', 'Importação de Backup Total');
-    return true;
   },
 
   // --- MEDIDORES ---
@@ -238,12 +214,11 @@ export const db = {
       ...meter,
       id: meter.id || generateUUID(),
       synced: false,
-      created_at: meter.created_at || now,
+      createdAt: now,
       updated_at: now
     };
     list.push(newMeter);
     db.saveMeters(list);
-    db.addLog('Medidores', 'Novo Medidor', newMeter.id, newMeter.name);
   },
   deleteMeter: (id: string) => {
     const list = db.getMeters();
@@ -266,15 +241,16 @@ export const db = {
       ...reading,
       id: reading.id || generateUUID(),
       synced: false,
-      created_at: reading.created_at || now,
+      timestamp: reading.timestamp || now,
       updated_at: now
     };
     list.push(newReading);
     db.saveReadings(list);
-    db.addLog('Medidores', 'Nova Leitura', newReading.meterId);
   },
   getReadingsByMeter: (meterId: string): MeterReading[] => {
-    return db.getReadings().filter(r => r.meterId === meterId).sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return db.getReadings()
+      .filter(r => r.meterId === meterId)
+      .sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   },
 
   // --- CAFÉ ---
@@ -289,11 +265,12 @@ export const db = {
     const list = db.getBreakfastList();
     const index = list.findIndex(item => item.id === id);
     if (index !== -1) {
+      const now = new Date().toISOString();
       list[index].status = 'Entregue';
-      list[index].deliveredAt = new Date().toISOString();
+      list[index].deliveredAt = now;
       list[index].operatorName = operatorName;
       list[index].synced = false;
-      list[index].updated_at = new Date().toISOString();
+      list[index].updated_at = now;
       db.saveBreakfastList(list);
     }
   },
@@ -304,7 +281,6 @@ export const db = {
       ...person,
       id: person.id || generateUUID(),
       synced: false,
-      created_at: person.created_at || now,
       updated_at: now
     };
     list.push(newPerson);
@@ -328,7 +304,7 @@ export const db = {
   addPackage: (record: PackageRecord) => {
     const list = db.getPackages();
     const now = new Date().toISOString();
-    const newPkg = { ...record, id: record.id || generateUUID(), synced: false, created_at: now, updated_at: now };
+    const newPkg = { ...record, id: record.id || generateUUID(), synced: false, receivedAt: now, updated_at: now };
     list.push(newPkg);
     db.savePackages(list);
   },
@@ -357,7 +333,13 @@ export const db = {
   addEntry: (entry: VehicleEntry) => {
     const entries = db.getEntries();
     const now = new Date().toISOString();
-    const newEntry = { ...entry, id: entry.id || generateUUID(), synced: false, created_at: now, updated_at: now };
+    const newEntry = { 
+      ...entry, 
+      id: entry.id || generateUUID(), 
+      synced: false, 
+      createdAt: entry.createdAt || now, 
+      updated_at: now 
+    };
     entries.push(newEntry);
     db.saveEntries(entries);
   },
@@ -369,14 +351,12 @@ export const db = {
       db.saveEntries(entries);
     }
   },
-
   deleteProfileEntries: (name: string, plate: string) => {
     const entries = db.getEntries();
     const toRemove = entries.filter(e => e.driverName.toLowerCase() === name.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === plate.toLowerCase());
     db.saveEntries(entries.filter(e => !(e.driverName.toLowerCase() === name.toLowerCase() && (e.vehiclePlate || '').toLowerCase() === plate.toLowerCase())));
     toRemove.forEach(e => db.markForDeletion(e.id, 'vehicle_entries'));
   },
-
   updateProfileEntries: (oldName: string, oldPlate: string, updates: Partial<VehicleEntry>) => {
     const entries = db.getEntries();
     const now = new Date().toISOString();
@@ -387,6 +367,24 @@ export const db = {
       return e;
     });
     db.saveEntries(updated);
+  },
+  // Fix: Added importEntries method for unifying data from external files
+  importEntries: (newEntries: VehicleEntry[], origin: ImportOrigin) => {
+    const current = db.getEntries();
+    const currentIds = new Set(current.map(e => e.id));
+    let addedCount = 0;
+    
+    newEntries.forEach(entry => {
+      if (!currentIds.has(entry.id)) {
+        current.push({ ...entry, origin, synced: false });
+        addedCount++;
+      }
+    });
+    
+    if (addedCount > 0) {
+      db.saveEntries(current);
+    }
+    return addedCount;
   },
 
   // --- PONTO ---
@@ -404,43 +402,73 @@ export const db = {
     if (index !== -1) {
       shifts[index] = { ...updatedShift, synced: false, updated_at: now };
     } else {
-      shifts.push({ ...updatedShift, id: updatedShift.id || generateUUID(), synced: false, created_at: now, updated_at: now });
+      shifts.push({ ...updatedShift, id: updatedShift.id || generateUUID(), synced: false, updated_at: now });
     }
     db.saveShifts(shifts);
   },
 
-  importEntries: (newEntries: VehicleEntry[], origin: ImportOrigin): number => {
-    const currentEntries = db.getEntries();
-    const currentIds = new Set(currentEntries.map(e => e.id));
-    const now = new Date().toISOString();
-    const toAdd = newEntries.filter(e => !currentIds.has(e.id)).map(e => ({ ...e, id: e.id || generateUUID(), origin, synced: false, created_at: now, updated_at: now }));
-    if (toAdd.length > 0) {
-      db.saveEntries([...currentEntries, ...toAdd]);
-    }
-    return toAdd.length;
-  },
-  
+  // --- SETTINGS ---
   getSettings: (): AppSettings => {
     const data = localStorage.getItem(STORAGE_KEYS.SETTINGS);
     const defaults: AppSettings = {
-      sectorContacts: [{ id: '1', name: 'Logística', number: '5500000000000' }, { id: '2', name: 'Almoxarifado', number: '5500000000000' }],
-      companyName: 'Portaria PX', deviceName: 'Estação Principal', theme: 'light', fontSize: 'medium', synced: true
+      sectorContacts: [],
+      companyName: 'Portaria PX', 
+      deviceName: 'Estação Principal', 
+      theme: 'light', 
+      fontSize: 'medium', 
+      synced: true
     };
     return data ? JSON.parse(data) : defaults;
   },
-  
   saveSettings: (settings: AppSettings) => {
     localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify({ ...settings, synced: false, updated_at: new Date().toISOString() }));
   },
-  
+
+  // --- DRAFT ---
+  // Fix: Added draft management methods used in NewEntryFlow
   getDraft: () => {
-    const data = localStorage.getItem(STORAGE_KEYS.DRAFT);
-    return data ? JSON.parse(data) : null;
+    try {
+      const data = localStorage.getItem(STORAGE_KEYS.DRAFT);
+      return data ? JSON.parse(data) : null;
+    } catch { return null; }
   },
   saveDraft: (formData: any, step: number) => {
     localStorage.setItem(STORAGE_KEYS.DRAFT, JSON.stringify({ formData, step }));
   },
   clearDraft: () => {
     localStorage.removeItem(STORAGE_KEYS.DRAFT);
+  },
+
+  // --- BACKUP & RESTORE ---
+  // Fix: Added complete backup export and restore methods used in Settings
+  exportCompleteBackup: () => {
+    const data = {
+      entries: db.getEntries(),
+      breakfast: db.getBreakfastList(),
+      packages: db.getPackages(),
+      meters: db.getMeters(),
+      readings: db.getReadings(),
+      shifts: db.getShifts(),
+      logs: db.getLogs(),
+      patrols: db.getPatrols(),
+      settings: db.getSettings()
+    };
+    return JSON.stringify(data);
+  },
+  importCompleteBackup: (jsonStr: string) => {
+    try {
+      const data = JSON.parse(jsonStr);
+      if (data.entries) db.saveEntries(data.entries);
+      if (data.breakfast) db.saveBreakfastList(data.breakfast);
+      if (data.packages) db.savePackages(data.packages);
+      if (data.meters) db.saveMeters(data.meters);
+      if (data.readings) db.saveReadings(data.readings);
+      if (data.shifts) db.saveShifts(data.shifts);
+      if (data.logs) db.saveLogs(data.logs);
+      if (data.patrols) db.savePatrols(data.patrols);
+      if (data.settings) db.saveSettings(data.settings);
+    } catch (e) {
+      throw new Error("Formato de backup inválido.");
+    }
   }
 };

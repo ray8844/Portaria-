@@ -4,57 +4,71 @@ import { db } from './db';
 import { STORAGE_KEYS } from '../constants';
 import { AppSettings, SyncStatus } from '../types';
 
-/**
- * SERVIÇO DE SINCRONIZAÇÃO BIDIRECIONAL
- * Push: Envia mudanças locais não sincronizadas para o Supabase.
- * Pull: Baixa mudanças remotas feitas por outros dispositivos.
- */
-
 export const syncService = {
   
   async checkConnection(): Promise<boolean> {
     try {
-      const { error } = await supabase.from('app_logs').select('id').limit(1);
-      return !error;
+      const { error } = await supabase.from('app_settings').select('user_id').limit(1);
+      return !error || error.code !== 'PGRST301';
     } catch {
       return false;
     }
   },
 
-  async syncAllModules(onStatusChange?: (status: SyncStatus) => void): Promise<{ success: boolean; message: string }> {
-    if (!navigator.onLine) {
-      return { success: false, message: 'Sem conexão com a internet.' };
-    }
+  withTimeout<T>(promise: Promise<T>, timeoutMs: number = 90000): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error('Tempo limite atingido.')), timeoutMs)
+      )
+    ]);
+  },
 
+  async syncAllModules(onStatusChange?: (status: SyncStatus) => void): Promise<{ success: boolean; message: string }> {
+    if (!navigator.onLine) return { success: false, message: 'Sem conexão com a internet.' };
     if (onStatusChange) onStatusChange('syncing');
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session) throw new Error("Sessão inválida para sincronização.");
+      if (!session) throw new Error("Sessão expirada.");
       const userId = session.user.id;
 
-      // 1. PROCESSAR FILA DE EXCLUSÃO (PUSH DELETE)
-      await this.processDeletionQueue();
+      const runSync = async () => {
+        // 1. Processa deleções
+        await this.processDeletionQueue();
+        
+        // 2. Push (Local -> Nuvem)
+        const pushResults = await this.pushAllModules(userId);
+        
+        // 3. Pull (Nuvem -> Local)
+        const pullResults = await this.pullAllModules(userId);
 
-      // 2. ENVIAR DADOS LOCAIS (PUSH UPSERT)
-      await this.pushAllModules(userId);
+        const totalChanges = pullResults.totalAdded + pullResults.totalUpdated;
+        
+        if (pushResults.errors > 0) {
+           return { 
+             success: false, 
+             message: `Sync parcial: ${pushResults.errors} falhas.` 
+           };
+        }
 
-      // 3. BAIXAR DADOS REMOTOS (PULL)
-      const pullResults = await this.pullAllModules(userId);
+        return { 
+          success: true, 
+          message: totalChanges > 0 
+            ? `Sync OK! +${totalChanges} registros.`
+            : 'Tudo atualizado.'
+        };
+      };
 
-      if (onStatusChange) onStatusChange('success');
+      const result = await this.withTimeout(runSync(), 180000);
       
-      let message = 'Sincronização concluída.';
-      if (pullResults.totalAdded > 0) {
-        message += ` ${pullResults.totalAdded} novos registros recebidos da nuvem!`;
-      }
-
-      return { success: true, message };
+      if (onStatusChange) onStatusChange(result.success ? 'success' : 'error');
+      return result;
 
     } catch (err: any) {
-      console.error("Erro na sincronização:", err);
+      console.error("❌ Erro no sync:", err);
       if (onStatusChange) onStatusChange('error');
-      return { success: false, message: `Erro ao sincronizar: ${err.message}` };
+      return { success: false, message: err.message || 'Falha de comunicação.' };
     }
   },
 
@@ -63,142 +77,254 @@ export const syncService = {
     if (queue.length === 0) return;
     const processedIds: string[] = [];
     const byTable: Record<string, string[]> = {};
+    
     queue.forEach(item => {
       if (!byTable[item.table]) byTable[item.table] = [];
       byTable[item.table].push(item.id);
     });
+
     for (const table of Object.keys(byTable)) {
-      const ids = byTable[table];
-      const { error } = await supabase.from(table).delete().in('id', ids);
-      if (!error) processedIds.push(...ids);
+      try {
+        const { error } = await supabase.from(table).delete().in('id', byTable[table]);
+        if (!error) processedIds.push(...byTable[table]);
+      } catch (e) { console.warn(`Falha ao deletar ${table}`, e); }
     }
     db.clearDeletedQueue(processedIds);
   },
 
-  // --- PUSH: ENVIAR PARA NUVEM ---
+  async pushAllModules(userId: string): Promise<{ success: number; errors: number }> {
+    let stats = { success: 0, errors: 0 };
 
-  async pushAllModules(userId: string) {
-    await this.pushEntries(userId);
-    await this.pushBreakfast(userId);
-    await this.pushPackages(userId);
-    await this.pushMeters(userId);
-    await this.pushMeterReadings(userId);
-    await this.pushPatrols(userId);
-    await this.pushLogs(userId);
-    await this.pushSettings(userId);
+    const safePush = async (name: string, fn: () => Promise<any>) => {
+      try { 
+        await fn(); 
+        stats.success++;
+      } catch (e) { 
+        console.error(`Erro [${name}]:`, e);
+        stats.errors++;
+      }
+    };
+
+    await safePush('Settings', () => this.pushSettings(userId));
+    await safePush('Entries', () => this.pushEntries(userId));
+    await safePush('Breakfast', () => this.pushBreakfast(userId));
+    await safePush('Packages', () => this.pushPackages(userId));
+    await safePush('Shifts', () => this.pushShifts(userId));
+    await safePush('Meters', () => this.pushMeters(userId));
+    await safePush('Readings', () => this.pushMeterReadingsChunked(userId));
+    await safePush('Patrols', () => this.pushPatrolsChunked(userId));
+    await safePush('Logs', () => this.pushLogs(userId));
+
+    return stats;
   },
 
   async pushEntries(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.ENTRIES);
     if (records.length === 0) return;
     const payload = records.map(r => ({
-      id: r.id, user_id: userId, access_type: r.accessType, driver_name: r.driverName,
-      company: r.company, supplier: r.supplier, operation_type: r.operationType,
-      order_number: r.orderNumber, vehicle_plate: r.vehiclePlate, trailer_plate: r.trailerPlate,
-      is_truck: r.isTruck, document_number: r.documentNumber, visit_reason: r.visitReason,
-      visited_person: r.visitedPerson, status: r.status, rejection_reason: r.rejectionReason,
-      entry_time: r.entryTime, exit_time: r.exitTime, volumes: r.volumes, sector: r.sector,
-      observations: r.observations, exit_observations: r.exitObservations,
-      created_at: r.created_at || r.createdAt, updated_at: r.updated_at,
-      operator_name: r.operatorName, device_name: r.deviceName, authorized_by: r.authorizedBy, origin: r.origin
+      id: r.id, 
+      user_id: userId, 
+      access_type: r.accessType, 
+      driver_name: r.driverName,
+      company: r.company, 
+      supplier: r.supplier, 
+      operation_type: r.operationType,
+      order_number: r.orderNumber, 
+      vehicle_plate: r.vehiclePlate, 
+      trailer_plate: r.trailerPlate,
+      is_truck: r.isTruck, 
+      document_number: r.documentNumber, 
+      visit_reason: r.visitReason,
+      visited_person: r.visitedPerson, 
+      status: r.status, 
+      rejection_reason: r.rejectionReason,
+      entry_time: r.entryTime, 
+      exit_time: r.exitTime, 
+      volumes: r.volumes, 
+      sector: r.sector,
+      observations: r.observations, 
+      exit_observations: r.exitObservations,
+      created_at: r.createdAt, 
+      updated_at: r.updated_at || new Date().toISOString(),
+      operator_name: r.operatorName, 
+      device_name: r.deviceName, 
+      authorized_by: r.authorizedBy, 
+      origin: r.origin
     }));
     const { error } = await supabase.from('vehicle_entries').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.ENTRIES, records.map(r => r.id));
+    if (error) throw error;
+    db.markAsSynced(STORAGE_KEYS.ENTRIES, records.map(r => r.id));
   },
 
   async pushBreakfast(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.BREAKFAST);
     if (records.length === 0) return;
     const payload = records.map(r => ({
-      id: r.id, user_id: userId, person_name: r.personName, breakfast_type: r.breakfastType,
-      status: r.status, delivered_at: r.deliveredAt, operator_name: r.operatorName,
-      date: r.date, observations: r.observations, origin: r.origin, created_at: r.created_at, updated_at: r.updated_at
+      id: r.id, 
+      user_id: userId, 
+      person_name: r.personName, 
+      breakfast_type: r.breakfastType,
+      status: r.status, 
+      delivered_at: r.deliveredAt, 
+      operator_name: r.operatorName,
+      date: r.date, 
+      observations: r.observations, 
+      origin: r.origin, 
+      created_at: r.created_at || new Date().toISOString(), 
+      updated_at: r.updated_at || new Date().toISOString()
     }));
     const { error } = await supabase.from('breakfast_list').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.BREAKFAST, records.map(r => r.id));
+    if (error) throw error;
+    db.markAsSynced(STORAGE_KEYS.BREAKFAST, records.map(r => r.id));
   },
 
   async pushPackages(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.PACKAGES);
     if (records.length === 0) return;
     const payload = records.map(r => ({
-      id: r.id, user_id: userId, delivery_company: r.deliveryCompany, recipient_name: r.recipientName,
-      description: r.description, operator_name: r.operatorName, received_at: r.receivedAt,
-      status: r.status, delivered_at: r.deliveredAt, delivered_to: r.deliveredTo, pickup_type: r.pickupType,
-      created_at: r.created_at, updated_at: r.updated_at
+      id: r.id, 
+      user_id: userId, 
+      delivery_company: r.deliveryCompany, 
+      recipient_name: r.recipientName,
+      description: r.description, 
+      operator_name: r.operatorName, 
+      received_at: r.receivedAt,
+      status: r.status, 
+      delivered_at: r.deliveredAt, 
+      delivered_to: r.deliveredTo, 
+      pickup_type: r.pickupType,
+      created_at: r.created_at || new Date().toISOString(), 
+      updated_at: r.updated_at || new Date().toISOString()
     }));
     const { error } = await supabase.from('packages').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.PACKAGES, records.map(r => r.id));
+    if (error) throw error;
+    db.markAsSynced(STORAGE_KEYS.PACKAGES, records.map(r => r.id));
   },
 
   async pushMeters(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.METERS);
     if (records.length === 0) return;
     const payload = records.map(r => ({
-      id: r.id, user_id: userId, name: r.name, type: r.type, unit: r.unit, custom_unit: r.customUnit,
-      active: r.active, created_at: r.created_at || r.createdAt, updated_at: r.updated_at
+      id: r.id, 
+      user_id: userId, 
+      name: r.name, 
+      type: r.type, 
+      unit: r.unit, 
+      custom_unit: r.customUnit,
+      active: r.active, 
+      created_at: r.createdAt, 
+      updated_at: r.updated_at || new Date().toISOString()
     }));
     const { error } = await supabase.from('meters').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.METERS, records.map(r => r.id));
+    if (error) throw error;
+    db.markAsSynced(STORAGE_KEYS.METERS, records.map(r => r.id));
   },
 
-  async pushMeterReadings(userId: string) {
+  async pushMeterReadingsChunked(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.METER_READINGS);
     if (records.length === 0) return;
-    const payload = records.map(r => ({
-      id: r.id, user_id: userId, meter_id: r.meterId, value: r.value, consumption: r.consumption,
-      observation: r.observation, operator: r.operator, timestamp: r.timestamp, created_at: r.created_at, updated_at: r.updated_at
-    }));
-    const { error } = await supabase.from('meter_readings').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.METER_READINGS, records.map(r => r.id));
+    for (const r of records) {
+      const payload = {
+        id: r.id, 
+        user_id: userId, 
+        meter_id: r.meterId, 
+        value: r.value, 
+        consumption: r.consumption,
+        observation: r.observation, 
+        operator: r.operator, 
+        timestamp: r.timestamp,
+        photo: r.photo, 
+        created_at: r.created_at || new Date().toISOString(), 
+        updated_at: r.updated_at || new Date().toISOString()
+      };
+      const { error } = await supabase.from('meter_readings').upsert(payload);
+      if (!error) db.markAsSynced(STORAGE_KEYS.METER_READINGS, [r.id]);
+    }
   },
 
-  async pushPatrols(userId: string) {
+  async pushPatrolsChunked(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.PATROLS);
     if (records.length === 0) return;
+    for (const r of records) {
+      const payload = {
+        id: r.id, 
+        user_id: userId, 
+        data: r.data, 
+        hora_inicio: r.horaInicio, 
+        hora_fim: r.horaFim,
+        duracao_minutos: r.duracaoMinutos, 
+        porteiro: r.porteiro, 
+        status: r.status, 
+        observacoes: r.observacoes,
+        fotos: r.fotos, 
+        created_at: r.createdAt, 
+        updated_at: r.updated_at || new Date().toISOString()
+      };
+      const { error } = await supabase.from('patrols').upsert(payload);
+      if (!error) db.markAsSynced(STORAGE_KEYS.PATROLS, [r.id]);
+    }
+  },
+
+  async pushShifts(userId: string) {
+    const records = db.getUnsyncedItems<any>(STORAGE_KEYS.SHIFTS);
+    if (records.length === 0) return;
     const payload = records.map(r => ({
-      id: r.id, user_id: userId, data: r.data, hora_inicio: r.horaInicio, hora_fim: r.horaFim,
-      duracao_minutos: r.duracaoMinutos, porteiro: r.porteiro, status: r.status, observacoes: r.observacoes,
-      criado_em: r.criadoEm || r.created_at, created_at: r.created_at, updated_at: r.updated_at
+      id: r.id, 
+      user_id: userId, 
+      operator_name: r.operatorName, 
+      date: r.date,
+      clock_in: r.clockIn, 
+      lunch_start: r.lunchStart, 
+      lunch_end: r.lunchEnd, 
+      clock_out: r.clockOut,
+      created_at: r.created_at || new Date().toISOString(), 
+      updated_at: r.updated_at || new Date().toISOString()
     }));
-    const { error } = await supabase.from('patrols').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.PATROLS, records.map(r => r.id));
+    const { error } = await supabase.from('work_shifts').upsert(payload);
+    if (error) throw error;
+    db.markAsSynced(STORAGE_KEYS.SHIFTS, records.map(r => r.id));
   },
 
   async pushLogs(userId: string) {
     const records = db.getUnsyncedItems<any>(STORAGE_KEYS.LOGS);
     if (records.length === 0) return;
     const payload = records.map(r => ({
-      id: r.id, user_id: userId, timestamp: r.timestamp, user_name: r.user, module: r.module,
-      action: r.action, reference_id: r.referenceId, details: r.details, created_at: r.created_at
+      id: r.id, 
+      user_id: userId, 
+      timestamp: r.timestamp, 
+      user_name: r.user, 
+      module: r.module,
+      action: r.action, 
+      reference_id: r.referenceId, 
+      details: r.details, 
+      created_at: r.created_at || new Date().toISOString()
     }));
     const { error } = await supabase.from('app_logs').upsert(payload);
-    if (!error) db.markAsSynced(STORAGE_KEYS.LOGS, records.map(r => r.id));
+    if (error) throw error;
+    db.markAsSynced(STORAGE_KEYS.LOGS, records.map(r => r.id));
   },
 
   async pushSettings(userId: string) {
     const settings = db.getSettings();
     if (settings.synced) return;
     const payload = {
-      user_id: userId, company_name: settings.companyName, device_name: settings.deviceName,
-      theme: settings.theme, font_size: settings.fontSize, sector_contacts: settings.sectorContacts,
+      user_id: userId, 
+      company_name: settings.companyName, 
+      device_name: settings.deviceName,
+      theme: settings.theme, 
+      font_size: settings.fontSize, 
+      sector_contacts: settings.sectorContacts,
       updated_at: new Date().toISOString()
     };
     const { error } = await supabase.from('app_settings').upsert(payload, { onConflict: 'user_id' });
-    if (!error) {
-      localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify({ ...settings, synced: true }));
-    }
+    if (error) throw error;
+    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify({ ...settings, synced: true }));
   },
-
-  // --- PULL: BAIXAR DA NUVEM ---
 
   async pullAllModules(userId: string) {
     const results = { totalAdded: 0, totalUpdated: 0 };
-
-    // Buscamos apenas os dados mais recentes (ex: últimos 7 dias) para economia de banda
-    const lastWeek = new Date();
-    lastWeek.setDate(lastWeek.getDate() - 7);
-    const dateLimit = lastWeek.toISOString();
+    const dateLimit = new Date();
+    dateLimit.setDate(dateLimit.getDate() - 3);
 
     const modules = [
       { table: 'vehicle_entries', key: STORAGE_KEYS.ENTRIES },
@@ -207,39 +333,28 @@ export const syncService = {
       { table: 'meters', key: STORAGE_KEYS.METERS },
       { table: 'meter_readings', key: STORAGE_KEYS.METER_READINGS },
       { table: 'patrols', key: STORAGE_KEYS.PATROLS },
-      { table: 'app_settings', key: STORAGE_KEYS.SETTINGS }
+      { table: 'work_shifts', key: STORAGE_KEYS.SHIFTS }
     ];
 
     for (const mod of modules) {
-      const { data, error } = await supabase
-        .from(mod.table)
-        .select('*')
-        .eq('user_id', userId)
-        .gt('updated_at', dateLimit);
+      try {
+        const { data, error } = await supabase
+          .from(mod.table)
+          .select('*')
+          .eq('user_id', userId)
+          .gt('updated_at', dateLimit.toISOString());
 
-      if (!error && data) {
-        // Mapeamos de volta para o formato local CamelCase se necessário
-        const mappedData = this.mapToLocal(mod.table, data);
-        
-        if (mod.table === 'app_settings' && data.length > 0) {
-           // Settings é um caso especial (Single record)
-           const cloudSettings = mappedData[0] as AppSettings;
-           const local = db.getSettings();
-           if (local.updated_at! < cloudSettings.updated_at!) {
-              localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify({ ...cloudSettings, synced: true }));
-           }
-        } else {
+        if (!error && data) {
+          const mappedData = this.mapToLocal(mod.table, data);
           const res = db.upsertFromCloud(mod.key, mappedData);
           results.totalAdded += res.added;
           results.totalUpdated += res.updated;
         }
-      }
+      } catch (e) { console.warn(`Falha no pull: ${mod.table}`); }
     }
-
     return results;
   },
 
-  // Converte Snake Case (Supabase) -> Camel Case (App Local)
   mapToLocal(table: string, data: any[]): any[] {
     return data.map(r => {
       switch (table) {
@@ -250,7 +365,7 @@ export const syncService = {
           documentNumber: r.document_number, visitReason: r.visit_reason, visitedPerson: r.visited_person,
           status: r.status, rejectionReason: r.rejection_reason, entryTime: r.entry_time, exitTime: r.exit_time,
           volumes: r.volumes, sector: r.sector, observations: r.observations, exitObservations: r.exit_observations,
-          created_at: r.created_at, updated_at: r.updated_at, operatorName: r.operator_name,
+          createdAt: r.created_at, updated_at: r.updated_at, operatorName: r.operator_name,
           deviceName: r.device_name, authorizedBy: r.authorized_by, origin: r.origin
         };
         case 'breakfast_list': return {
@@ -266,21 +381,22 @@ export const syncService = {
         };
         case 'meters': return {
           id: r.id, name: r.name, type: r.type, unit: r.unit, customUnit: r.custom_unit,
-          active: r.active, created_at: r.created_at, updated_at: r.updated_at
+          active: r.active, createdAt: r.created_at, updated_at: r.updated_at
         };
         case 'meter_readings': return {
           id: r.id, meterId: r.meter_id, value: r.value, consumption: r.consumption,
           observation: r.observation, operator: r.operator, timestamp: r.timestamp,
-          created_at: r.created_at, updated_at: r.updated_at
+          photo: r.photo, created_at: r.created_at, updated_at: r.updated_at
         };
         case 'patrols': return {
           id: r.id, data: r.data, horaInicio: r.hora_inicio, horaFim: r.hora_fim,
           duracaoMinutos: r.duracao_minutos, porteiro: r.porteiro, status: r.status,
-          observacoes: r.observacoes, created_at: r.created_at, updated_at: r.updated_at
+          observacoes: r.observacoes, fotos: r.fotos, createdAt: r.created_at, updated_at: r.updated_at
         };
-        case 'app_settings': return {
-          companyName: r.company_name, deviceName: r.device_name, theme: r.theme,
-          fontSize: r.font_size, sectorContacts: r.sector_contacts, updated_at: r.updated_at
+        case 'work_shifts': return {
+          id: r.id, operatorName: r.operator_name, date: r.date,
+          clockIn: r.clock_in, lunchStart: r.lunch_start, lunch_end: r.lunch_end, clockOut: r.clock_out,
+          created_at: r.created_at, updated_at: r.updated_at
         };
         default: return r;
       }

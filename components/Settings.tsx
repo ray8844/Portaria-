@@ -42,10 +42,11 @@ const Settings: React.FC<SettingsProps> = ({
   ];
 
   const handleManualSync = async () => {
-    setManualSyncStatus('syncing');
-    const result = await syncService.syncAllModules();
-    setManualSyncStatus(result.success ? 'success' : 'error');
+    // Agora passamos o setManualSyncStatus para o serviço para ver o status real
+    const result = await syncService.syncAllModules(setManualSyncStatus);
     if (!result.success) alert(result.message);
+    
+    // Volta para idle após 3 segundos para limpar o ícone de sucesso/erro
     setTimeout(() => setManualSyncStatus('idle'), 3000);
   };
 
@@ -146,7 +147,7 @@ const Settings: React.FC<SettingsProps> = ({
              <div className="bg-emerald-600 text-white p-6 rounded-3xl shadow-lg flex flex-col justify-between animate-in zoom-in h-32">
                  <div>
                     <h3 className="font-bold text-lg">Nuvem</h3>
-                    <p className="text-xs opacity-80">Status: {manualSyncStatus === 'syncing' ? 'Enviando...' : manualSyncStatus === 'success' ? 'OK' : 'Pendente'}</p>
+                    <p className="text-xs opacity-80">Status: {manualSyncStatus === 'syncing' ? 'Trocando dados...' : manualSyncStatus === 'success' ? 'OK' : manualSyncStatus === 'error' ? 'Erro' : 'Pendente'}</p>
                  </div>
                  <button 
                    onClick={handleManualSync} 
