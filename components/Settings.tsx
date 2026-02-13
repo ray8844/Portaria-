@@ -42,11 +42,8 @@ const Settings: React.FC<SettingsProps> = ({
   ];
 
   const handleManualSync = async () => {
-    // Agora passamos o setManualSyncStatus para o serviço para ver o status real
     const result = await syncService.syncAllModules(setManualSyncStatus);
     if (!result.success) alert(result.message);
-    
-    // Volta para idle após 3 segundos para limpar o ícone de sucesso/erro
     setTimeout(() => setManualSyncStatus('idle'), 3000);
   };
 
@@ -56,7 +53,6 @@ const Settings: React.FC<SettingsProps> = ({
       const backupStr = db.exportCompleteBackup();
       const date = new Date().toISOString().replace(/T/, '_').replace(/:/g, '-').split('.')[0];
       const filename = `portaria_backup_${date}.json`;
-      
       const blob = new Blob([backupStr], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -66,7 +62,6 @@ const Settings: React.FC<SettingsProps> = ({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      
       alert("📦 Backup gerado com sucesso! Salve o arquivo para transferir os dados ao próximo colega.");
     } catch (err) {
       alert("Erro ao gerar backup. Tente novamente.");
@@ -78,38 +73,31 @@ const Settings: React.FC<SettingsProps> = ({
   const handleRestoreBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    if (!confirm("⚠️ ATENÇÃO: Esta ação substituirá TODOS os dados atuais (Café, Encomendas, Medidores, Portaria) pelos dados deste arquivo. Deseja continuar?")) {
+    if (!confirm("⚠️ ATENÇÃO: Esta ação substituirá TODOS os dados atuais. Deseja continuar?")) {
       e.target.value = '';
       return;
     }
-
     setIsProcessing(true);
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
         const jsonStr = event.target?.result as string;
         db.importCompleteBackup(jsonStr);
-        alert("✅ Dados restaurados com sucesso! Atualize a página se necessário.");
+        alert("✅ Dados restaurados com sucesso!");
         onSave(db.getSettings());
         onBack();
       } catch (err: any) {
         alert(`❌ Erro ao restaurar: ${err.message}`);
-        console.error(err);
       } finally {
         setIsProcessing(false);
         if (restoreInputRef.current) restoreInputRef.current.value = '';
       }
     };
-    reader.onerror = () => {
-      alert("Falha ao ler o arquivo selecionado.");
-      setIsProcessing(false);
-    };
     reader.readAsText(file);
   };
 
   return (
-    <div className="p-6 space-y-8 animate-in slide-in-from-right duration-300">
+    <div className="p-6 space-y-8 animate-in slide-in-from-right duration-300 pb-24">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <button onClick={onBack} className="p-2 text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 rounded-lg transition-colors">
@@ -122,7 +110,6 @@ const Settings: React.FC<SettingsProps> = ({
           <button onClick={onSwitchUserRequest} className="text-slate-600 dark:text-slate-300 font-bold text-[10px] uppercase bg-slate-100 dark:bg-slate-800 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700">
             Trocar Usuário
           </button>
-
           {internalUser?.role === 'admin' && (
             <button onClick={onLogoutRequest} className="text-red-500 font-bold text-[10px] uppercase bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg border border-red-200 dark:border-red-900/30">
               Sair da Conta
@@ -131,31 +118,35 @@ const Settings: React.FC<SettingsProps> = ({
         </div>
       </div>
 
+      {/* SESSÃO DE SINCRONIZAÇÃO - AGORA PARA TODOS */}
+      <div className="grid grid-cols-1 gap-4">
+         <div className="bg-emerald-600 text-white p-6 rounded-3xl shadow-lg flex items-center justify-between animate-in zoom-in">
+             <div className="flex-1">
+                <h3 className="font-bold text-lg">Sincronizar Nuvem</h3>
+                <p className="text-xs opacity-80">
+                  {manualSyncStatus === 'syncing' ? 'Enviando e recebendo dados...' : 'Atualize os contatos e registros com o servidor.'}
+                </p>
+             </div>
+             <button 
+               onClick={handleManualSync} 
+               disabled={manualSyncStatus === 'syncing'}
+               className="bg-white text-emerald-600 h-16 w-16 rounded-2xl font-black shadow-md active:scale-95 transition-transform flex items-center justify-center shrink-0 ml-4"
+             >
+               {manualSyncStatus === 'syncing' ? <div className="animate-spin w-6 h-6 border-4 border-emerald-600 border-t-transparent rounded-full"/> : <Icons.Sync />}
+             </button>
+         </div>
+      </div>
+
       {internalUser?.role === 'admin' && (
         <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-             <div className="bg-blue-600 text-white p-6 rounded-3xl shadow-lg flex flex-col justify-between animate-in zoom-in h-32">
+          <div className="grid grid-cols-1 gap-4">
+             <div className="bg-blue-600 text-white p-6 rounded-3xl shadow-lg flex items-center justify-between animate-in zoom-in">
                  <div>
-                    <h3 className="font-bold text-lg">Usuários</h3>
-                    <p className="text-xs opacity-80">Controle de acesso.</p>
+                    <h3 className="font-bold text-lg">Gerenciar Usuários</h3>
+                    <p className="text-xs opacity-80">Criar contas para novos porteiros.</p>
                  </div>
-                 <button onClick={onManageUsers} className="bg-white text-blue-600 px-4 py-2 rounded-xl font-black text-xs uppercase shadow-md active:scale-95 transition-transform w-full">
+                 <button onClick={onManageUsers} className="bg-white text-blue-600 px-6 py-3 rounded-xl font-black text-xs uppercase shadow-md active:scale-95 transition-transform">
                    Gerenciar
-                 </button>
-             </div>
-
-             <div className="bg-emerald-600 text-white p-6 rounded-3xl shadow-lg flex flex-col justify-between animate-in zoom-in h-32">
-                 <div>
-                    <h3 className="font-bold text-lg">Nuvem</h3>
-                    <p className="text-xs opacity-80">Status: {manualSyncStatus === 'syncing' ? 'Trocando dados...' : manualSyncStatus === 'success' ? 'OK' : manualSyncStatus === 'error' ? 'Erro' : 'Pendente'}</p>
-                 </div>
-                 <button 
-                   onClick={handleManualSync} 
-                   disabled={manualSyncStatus === 'syncing'}
-                   className="bg-white text-emerald-600 px-4 py-2 rounded-xl font-black text-xs uppercase shadow-md active:scale-95 transition-transform w-full flex items-center justify-center gap-2"
-                 >
-                   {manualSyncStatus === 'syncing' ? <div className="animate-spin w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full"/> : <Icons.Sync />}
-                   {manualSyncStatus === 'syncing' ? '' : 'SINCRONIZAR'}
                  </button>
              </div>
           </div>
@@ -163,17 +154,14 @@ const Settings: React.FC<SettingsProps> = ({
           <div className="space-y-4 bg-amber-50 dark:bg-amber-900/10 p-6 rounded-3xl border border-amber-200 dark:border-amber-900/30">
             <div className="flex items-center gap-3 mb-2">
                <span className="text-xl">📦</span>
-               <h3 className="text-xs font-black text-amber-700 dark:text-amber-400 uppercase tracking-widest">Backup & Restauração</h3>
+               <h3 className="text-xs font-black text-amber-700 dark:text-amber-400 uppercase tracking-widest">Backup por Arquivo</h3>
             </div>
-            <p className="text-[10px] text-amber-600 dark:text-amber-500 leading-relaxed mb-4">
-              Use estas opções para transferir todo o trabalho do seu turno para outro dispositivo via arquivo.
-            </p>
             <div className="grid grid-cols-2 gap-3">
                <button onClick={handleExportBackup} disabled={isProcessing} className="bg-amber-600 disabled:opacity-50 text-white p-4 rounded-2xl font-bold text-[10px] uppercase shadow-lg active:scale-95 transition-all">
-                 {isProcessing ? "Gerando..." : "Exportar Turno"}
+                 {isProcessing ? "Gerando..." : "Exportar JSON"}
                </button>
                <button onClick={() => restoreInputRef.current?.click()} disabled={isProcessing} className="bg-white dark:bg-slate-800 border-2 border-amber-600 disabled:opacity-50 text-amber-700 dark:text-amber-400 p-4 rounded-2xl font-bold text-[10px] uppercase active:scale-95 transition-all">
-                 {isProcessing ? "Processando..." : "Restaurar Turno"}
+                 {isProcessing ? "Importar JSON" : "Importar JSON"}
                </button>
                <input type="file" ref={restoreInputRef} className="hidden" accept=".json" onChange={handleRestoreBackup} />
             </div>
@@ -192,12 +180,12 @@ const Settings: React.FC<SettingsProps> = ({
           </div>
         )}
 
-        {internalUser?.role === 'admin' ? (
+        {internalUser?.role === 'admin' && (
           <div className="space-y-4 bg-slate-50 dark:bg-slate-800/50 p-6 rounded-3xl border dark:border-slate-700">
-            <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest">Identificação</h3>
+            <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest">Identificação da Unidade</h3>
             <div className="grid grid-cols-1 gap-4">
               <div>
-                <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-500 uppercase mb-1">Dispositivo</label>
+                <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-500 uppercase mb-1">Nome do Dispositivo</label>
                 <input
                   className="w-full p-3 bg-white dark:bg-slate-900 rounded-xl border-none text-sm dark:text-white"
                   value={formData.deviceName}
@@ -205,7 +193,7 @@ const Settings: React.FC<SettingsProps> = ({
                 />
               </div>
               <div>
-                <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-500 uppercase mb-1">Empresa</label>
+                <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-500 uppercase mb-1">Nome da Empresa/Condomínio</label>
                 <input
                   className="w-full p-3 bg-white dark:bg-slate-900 rounded-xl border-none text-sm dark:text-white"
                   value={formData.companyName}
@@ -214,49 +202,48 @@ const Settings: React.FC<SettingsProps> = ({
               </div>
             </div>
           </div>
-        ) : (
-          <div className="p-6 rounded-3xl bg-slate-50 dark:bg-slate-800/50 border dark:border-slate-700 text-center">
-             <p className="text-xs text-slate-500">Configurações globais (Nome da Empresa) gerenciadas pelo Administrador.</p>
-          </div>
         )}
 
         <div className="space-y-4 bg-slate-50 dark:bg-slate-800/50 p-6 rounded-3xl border dark:border-slate-700">
-          <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest">Fonte</h3>
-          <div className="grid grid-cols-4 gap-2">
-            {fontSizes.map((size) => (
+          <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest">Aparência</h3>
+          <div>
+             <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase mb-2">Tamanho do Texto</label>
+             <div className="grid grid-cols-4 gap-2">
+               {fontSizes.map((size) => (
+                 <button
+                   key={size.id}
+                   onClick={() => setFormData({ ...formData, fontSize: size.id })}
+                   className={`flex flex-col items-center justify-center p-3 rounded-xl border-2 transition-all ${
+                     formData.fontSize === size.id ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400'
+                   }`}
+                 >
+                   <span className="text-lg font-black">{size.icon}</span>
+                   <span className="text-[9px] uppercase font-bold mt-1">{size.label}</span>
+                 </button>
+               ))}
+             </div>
+          </div>
+
+          <div className="pt-2">
+            <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase mb-2">Modo Noturno</label>
+            <div className="grid grid-cols-2 gap-3">
               <button
-                key={size.id}
-                onClick={() => setFormData({ ...formData, fontSize: size.id })}
-                className={`flex flex-col items-center justify-center p-3 rounded-xl border-2 transition-all ${
-                  formData.fontSize === size.id ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400'
+                onClick={() => setFormData({ ...formData, theme: 'light' })}
+                className={`p-4 rounded-xl border-2 font-bold transition-all ${
+                  formData.theme === 'light' ? 'bg-blue-50 border-blue-600 text-blue-700 shadow-sm' : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-400'
                 }`}
               >
-                <span className="text-lg font-black">{size.icon}</span>
-                <span className="text-[9px] uppercase font-bold mt-1">{size.label}</span>
+                ☀️ Claro
               </button>
-            ))}
-          </div>
-        </div>
-
-        <div>
-          <label className="block text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase mb-2">Tema</label>
-          <div className="grid grid-cols-2 gap-3">
-            <button
-              onClick={() => setFormData({ ...formData, theme: 'light' })}
-              className={`p-4 rounded-xl border-2 font-bold transition-all ${
-                formData.theme === 'light' ? 'bg-blue-50 border-blue-600 text-blue-700 shadow-sm' : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-400'
-              }`}
-            >
-              ☀️ Claro
-            </button>
-            <button
-              onClick={() => setFormData({ ...formData, theme: 'dark' })}
-              className={`p-4 rounded-xl border-2 font-bold transition-all ${
-                formData.theme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100 shadow-sm' : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-400'
-              }`}
-            >
-              🌙 Escuro
-            </button>
+              <button
+                onClick={() => setFormData({ ...formData, theme: 'dark' })}
+                className={`p-4 rounded-xl border-2 font-bold transition-all ${
+                  formData.theme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100 shadow-sm' : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-400'
+                }`}
+              >
+                🌙 Escuro
+              </button>
+            </div>
           </div>
         </div>
 
@@ -264,7 +251,7 @@ const Settings: React.FC<SettingsProps> = ({
           onClick={() => onSave(formData)}
           className="w-full bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 p-6 rounded-2xl text-xl font-bold shadow-lg transition-all active:scale-[0.98]"
         >
-          SALVAR ALTERAÇÕES
+          SALVAR TUDO
         </button>
       </div>
     </div>
