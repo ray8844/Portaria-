@@ -19,7 +19,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const fetchUserRole = async (userId: string) => {
     try {
-      // Timeout interno para a busca de role
       const { data, error } = await supabase
         .from('profiles')
         .select('role')
@@ -36,10 +35,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     let mounted = true;
 
-    // SAFETY TIMEOUT: Se em 6 segundos nada acontecer, força a saída do loading
     const forceExitLoading = setTimeout(() => {
       if (mounted && loading) {
-        console.warn("AuthContext: Timeout de segurança atingido. Forçando encerramento do loading.");
         setLoading(false);
       }
     }, 6000);
@@ -47,7 +44,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const initializeAuth = async () => {
       try {
         const { data: { session: initialSession }, error } = await supabase.auth.getSession();
-        
         if (error) throw error;
 
         if (mounted) {
@@ -61,7 +57,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
         }
       } catch (err) {
-        console.error("Erro crítico na inicialização do Auth:", err);
+        console.error("Auth Init Error:", err);
       } finally {
         if (mounted) {
           setLoading(false);
@@ -74,7 +70,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, newSession) => {
       if (!mounted) return;
-
       if (newSession) {
         setSession(newSession);
         const userRole = await fetchUserRole(newSession.user.id);
@@ -95,10 +90,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signOut = async () => {
     await supabase.auth.signOut();
-    localStorage.removeItem('portaria_express_internal_session');
+    
+    // Limpeza agressiva de todos os storages conhecidos
+    const keysToRemove = [
+      'portaria_express_internal_user_v2',
+      'portaria_express_internal_session',
+      'supabase.auth.token'
+    ];
+    keysToRemove.forEach(k => localStorage.removeItem(k));
+    sessionStorage.clear();
+
     setSession(null);
     setRole(null);
-    setLoading(false);
+    
+    // Força o navegador a recarregar a URL limpa para garantir que o estado do app morra
+    window.location.href = window.location.origin;
   };
 
   return (

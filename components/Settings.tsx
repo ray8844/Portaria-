@@ -14,11 +14,21 @@ interface SettingsProps {
   installPrompt?: any;
   onInstall?: () => void;
   onManageUsers: () => void;
+  onSwitchUserRequest: () => void;
+  onLogoutRequest: () => void;
 }
 
-const Settings: React.FC<SettingsProps> = ({ settings, onSave, onBack, installPrompt, onInstall, onManageUsers }) => {
-  const { internalUser, logoutInternal } = useInternalAuth();
-  const { signOut } = useAuth();
+const Settings: React.FC<SettingsProps> = ({ 
+  settings, 
+  onSave, 
+  onBack, 
+  installPrompt, 
+  onInstall, 
+  onManageUsers,
+  onSwitchUserRequest,
+  onLogoutRequest
+}) => {
+  const { internalUser } = useInternalAuth();
   const [formData, setFormData] = useState<AppSettings>(settings);
   const [isProcessing, setIsProcessing] = useState(false);
   const [manualSyncStatus, setManualSyncStatus] = useState<SyncStatus>('idle');
@@ -30,22 +40,6 @@ const Settings: React.FC<SettingsProps> = ({ settings, onSave, onBack, installPr
     { id: 'large', label: 'Grande', icon: 'A+' },
     { id: 'xlarge', label: 'Extra', icon: 'A++' },
   ];
-
-  const handleSwitchUser = () => {
-    if (confirm("Deseja trocar de usuário e voltar ao login operacional?")) {
-      db.addLog('Sistema', 'Troca de Usuário', undefined, `Usuário ${internalUser?.username} saiu.`);
-      logoutInternal();
-    }
-  };
-
-  const handleLogout = async () => {
-    if (internalUser?.role !== 'admin') return;
-    if (confirm("⚠️ ATENÇÃO: Isso desconectará a conta da empresa (Supabase). Continuar?")) {
-      db.addLog('Sistema', 'Logout Supabase', undefined, `Admin ${internalUser.username} desconectou a conta.`);
-      logoutInternal(); 
-      await signOut();  
-    }
-  };
 
   const handleManualSync = async () => {
     setManualSyncStatus('syncing');
@@ -96,9 +90,8 @@ const Settings: React.FC<SettingsProps> = ({ settings, onSave, onBack, installPr
         const jsonStr = event.target?.result as string;
         db.importCompleteBackup(jsonStr);
         alert("✅ Dados restaurados com sucesso! Atualize a página se necessário.");
-        // Removido reload manual para evitar loops
-        onSave(db.getSettings()); // Força atualização de settings se houver
-        onBack(); // Volta para dashboard
+        onSave(db.getSettings());
+        onBack();
       } catch (err: any) {
         alert(`❌ Erro ao restaurar: ${err.message}`);
         console.error(err);
@@ -125,19 +118,18 @@ const Settings: React.FC<SettingsProps> = ({ settings, onSave, onBack, installPr
         </div>
         
         <div className="flex gap-2">
-          <button onClick={handleSwitchUser} className="text-slate-600 dark:text-slate-300 font-bold text-[10px] uppercase bg-slate-100 dark:bg-slate-800 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700">
+          <button onClick={onSwitchUserRequest} className="text-slate-600 dark:text-slate-300 font-bold text-[10px] uppercase bg-slate-100 dark:bg-slate-800 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700">
             Trocar Usuário
           </button>
 
           {internalUser?.role === 'admin' && (
-            <button onClick={handleLogout} className="text-red-500 font-bold text-[10px] uppercase bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg border border-red-200 dark:border-red-900/30">
+            <button onClick={onLogoutRequest} className="text-red-500 font-bold text-[10px] uppercase bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg border border-red-200 dark:border-red-900/30">
               Sair da Conta
             </button>
           )}
         </div>
       </div>
 
-      {/* SESSÃO DE ADMINISTRAÇÃO */}
       {internalUser?.role === 'admin' && (
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
@@ -188,8 +180,6 @@ const Settings: React.FC<SettingsProps> = ({ settings, onSave, onBack, installPr
         </div>
       )}
 
-      {/* Identificação e Configurações */}
-      {/* ...resto do código mantido igual... */}
       <div className="space-y-6">
         {installPrompt && (
           <div className="bg-slate-800 p-6 rounded-3xl text-white shadow-lg flex items-center justify-between">

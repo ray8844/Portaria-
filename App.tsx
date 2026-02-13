@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ViewState, VehicleEntry, AppSettings, UserSession, SyncStatus } from './types';
 import { db } from './services/db';
 import { syncService } from './services/sync';
@@ -26,6 +26,73 @@ import MeterManager from './components/MeterManager';
 import SystemLogs from './components/SystemLogs';
 import PatrolManager from './components/PatrolManager';
 
+// Componente Interno para Confirmação com Seguro (Hold)
+const ConfirmHoldModal = ({ isOpen, onClose, onConfirm, title, description, color }: any) => {
+  const [progress, setProgress] = useState(0);
+  const timerRef = useRef<number | null>(null);
+
+  const startHold = () => {
+    setProgress(0);
+    const startTime = Date.now();
+    timerRef.current = window.setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      const newProgress = Math.min((elapsed / 2000) * 100, 100);
+      setProgress(newProgress);
+      if (newProgress >= 100) {
+        if (timerRef.current) clearInterval(timerRef.current);
+        onConfirm();
+      }
+    }, 50);
+  };
+
+  const stopHold = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    setProgress(0);
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-6 z-[200] animate-in fade-in duration-200">
+      <div className="bg-white dark:bg-slate-800 w-full max-w-sm rounded-[32px] p-8 shadow-2xl text-center space-y-6 animate-in zoom-in duration-300">
+        <div className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto ${color === 'red' ? 'bg-red-100 text-red-600' : 'bg-blue-100 text-blue-600'}`}>
+           <span className="text-2xl">⚠️</span>
+        </div>
+        <div>
+          <h3 className="text-xl font-black text-slate-900 dark:text-white uppercase tracking-tighter">{title}</h3>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-2">{description}</p>
+        </div>
+
+        <div className="space-y-4 pt-4">
+          <button
+            onPointerDown={startHold}
+            onPointerUp={stopHold}
+            onPointerLeave={stopHold}
+            className={`relative w-full py-6 rounded-2xl font-black text-sm uppercase tracking-widest overflow-hidden select-none transition-transform active:scale-95 ${
+              color === 'red' ? 'bg-red-600 text-white shadow-red-200' : 'bg-blue-600 text-white shadow-blue-200'
+            }`}
+          >
+            <span className="relative z-10">Segure para Confirmar</span>
+            <div 
+              className="absolute inset-y-0 left-0 bg-black/20 transition-all duration-75" 
+              style={{ width: `${progress}%` }}
+            />
+          </button>
+          
+          <button 
+            onClick={onClose}
+            className="w-full py-4 text-slate-400 dark:text-slate-500 font-bold text-xs uppercase hover:text-slate-600 dark:hover:text-slate-300 transition-colors"
+          >
+            Cancelar
+          </button>
+        </div>
+        
+        <p className="text-[10px] text-slate-400 dark:text-slate-600 font-bold uppercase">Mantenha pressionado por 2 segundos</p>
+      </div>
+    </div>
+  );
+};
+
 const App: React.FC = () => {
   const { session: supabaseSession, loading: authLoading, signOut } = useAuth();
   const { internalUser, isAuthenticated, loading: internalLoading, logoutInternal } = useInternalAuth();
@@ -36,35 +103,29 @@ const App: React.FC = () => {
   const [session, setSession] = useState<UserSession | null>(db.getSession());
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
-  
-  // Estado de Sincronização
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle');
 
-  // --- SYNC AUTOMÁTICO (30 MIN) ---
+  // Estado para os Modais de Confirmação
+  const [confirmModal, setConfirmModal] = useState<{
+    show: boolean;
+    type: 'switch' | 'logout';
+  }>({ show: false, type: 'switch' });
+
   useEffect(() => {
     const runAutoSync = async () => {
       if (navigator.onLine && supabaseSession) {
-        console.log("Iniciando sincronização automática...");
         await syncService.syncAllModules(setSyncStatus);
       }
     };
-
-    if (supabaseSession) {
-       runAutoSync();
-    }
-
-    const interval = setInterval(runAutoSync, 30 * 60 * 1000); // 30 minutos
-
+    if (supabaseSession) runAutoSync();
+    const interval = setInterval(runAutoSync, 30 * 60 * 1000);
     return () => clearInterval(interval);
   }, [supabaseSession]);
 
-  // Sincroniza sessão do Login Interno com a sessão local do App (db)
   useEffect(() => {
     if (isAuthenticated && internalUser) {
-      const userIdentifier = `${internalUser.username}@${supabaseSession?.user?.email}`;
       const localSession = db.getSession();
-      
-      if (!localSession || localSession.operatorName !== userIdentifier) {
+      if (!localSession || localSession.operatorName !== internalUser.username) {
         const newSession = {
           operatorName: internalUser.username, 
           loginTime: new Date().toISOString()
@@ -84,13 +145,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js', { scope: '/' })
-          .then(registration => {
-            console.log('SW registrado com sucesso:', registration.scope);
-          })
-          .catch(err => {
-            console.error('Falha ao registrar SW:', err);
-          });
+        navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
       });
     }
 
@@ -132,23 +187,21 @@ const App: React.FC = () => {
     setCurrentView('DASHBOARD');
   };
 
-  const handleSwitchUser = async () => {
-    if (confirm("Deseja trocar de usuário e voltar ao login operacional?")) {
-      db.addLog('Sistema', 'Troca de Usuário', undefined, `Usuário ${internalUser?.username} saiu.`);
-      logoutInternal();
-      setCurrentView('DASHBOARD');
-    }
+  // Funções de Confirmação Final
+  const executeSwitchUser = () => {
+    db.addLog('Sistema', 'Troca de Usuário', undefined, `Usuário ${internalUser?.username} saiu.`);
+    logoutInternal();
+    setCurrentView('DASHBOARD');
+    setConfirmModal({ ...confirmModal, show: false });
   };
 
-  const handleInstallApp = async () => {
-    if (!deferredPrompt) return;
-    deferredPrompt.prompt();
-    const { outcome } = await deferredPrompt.userChoice;
-    if (outcome === 'accepted') setDeferredPrompt(null);
+  const executeLogoutAccount = async () => {
+    db.addLog('Sistema', 'Logout Supabase', undefined, `Admin ${internalUser?.username} desconectou a conta.`);
+    logoutInternal(); 
+    await signOut();
+    setConfirmModal({ ...confirmModal, show: false });
   };
 
-  // 1. Loading Geral
-  // O AuthContext agora tem timeout de 3s, então isso não deve ficar preso.
   if (authLoading) {
     return (
       <div className="fixed inset-0 bg-slate-900 flex flex-col items-center justify-center gap-4 text-white">
@@ -158,10 +211,8 @@ const App: React.FC = () => {
     );
   }
 
-  // 2. Login Principal (Supabase)
   if (!supabaseSession) return <Login />;
 
-  // 3. Loading Interno (só deve aparecer se tiver sessão supabase)
   if (internalLoading) {
     return (
       <div className="fixed inset-0 bg-slate-900 flex flex-col items-center justify-center gap-4 text-white">
@@ -171,10 +222,8 @@ const App: React.FC = () => {
     );
   }
 
-  // 4. Login Interno (Camada 2)
   if (!isAuthenticated) return <InternalLogin />;
 
-  // 5. Troca de Senha
   if (internalUser?.must_change_password) return <ChangePassword />;
 
   const fontSizeClass = {
@@ -196,25 +245,6 @@ const App: React.FC = () => {
 
   const renderView = () => {
     const isAdmin = internalUser?.role === 'admin';
-    if (!isAdmin) {
-      if (currentView === 'MASTER_DATA' || currentView === 'SYSTEM_LOGS' || currentView === 'USER_MANAGEMENT') {
-        return <Dashboard 
-          onNewArrival={() => setCurrentView('NEW_ENTRY')} 
-          activeCount={entries.filter(e => e.entryTime && !e.exitTime).length}
-          onViewActive={() => setCurrentView('ACTIVE_LIST')}
-          onViewShift={() => setCurrentView('SHIFT_MANAGER')}
-          onViewMasterData={() => {}} 
-          onViewContacts={() => setCurrentView('CONTACTS')}
-          onViewBreakfast={() => setCurrentView('BREAKFAST')}
-          onViewPackages={() => setCurrentView('PACKAGES')}
-          onViewMeters={() => setCurrentView('METERS')}
-          onViewLogs={() => {}} 
-          onViewPatrols={() => setCurrentView('PATROLS')}
-          userRole={internalUser?.role}
-        />;
-      }
-    }
-
     switch (currentView) {
       case 'DASHBOARD':
         return <Dashboard 
@@ -222,12 +252,12 @@ const App: React.FC = () => {
           activeCount={entries.filter(e => e.entryTime && !e.exitTime).length}
           onViewActive={() => setCurrentView('ACTIVE_LIST')}
           onViewShift={() => setCurrentView('SHIFT_MANAGER')}
-          onViewMasterData={() => setCurrentView('MASTER_DATA')}
+          onViewMasterData={() => isAdmin ? setCurrentView('MASTER_DATA') : {}}
           onViewContacts={() => setCurrentView('CONTACTS')}
           onViewBreakfast={() => setCurrentView('BREAKFAST')}
           onViewPackages={() => setCurrentView('PACKAGES')}
           onViewMeters={() => setCurrentView('METERS')}
-          onViewLogs={() => setCurrentView('SYSTEM_LOGS')}
+          onViewLogs={() => isAdmin ? setCurrentView('SYSTEM_LOGS') : {}}
           onViewPatrols={() => setCurrentView('PATROLS')}
           userRole={internalUser?.role}
         />;
@@ -242,8 +272,7 @@ const App: React.FC = () => {
       case 'NEW_ENTRY': return <NewEntryFlow settings={settings} operatorName={internalUser?.username || 'Porteiro'} onComplete={() => { refreshEntries(); setCurrentView('DASHBOARD'); }} onCancel={() => setCurrentView('DASHBOARD')} />;
       case 'ACTIVE_LIST': return <ActiveVehicles entries={entries.filter(e => e.entryTime && !e.exitTime)} onUpdate={refreshEntries} onBack={() => setCurrentView('DASHBOARD')} />;
       case 'REPORTS': return <Reports entries={entries} onBack={() => setCurrentView('DASHBOARD')} onUpdate={refreshEntries} />;
-      case 'SYNC': return <Sync entries={entries} onUpdate={refreshEntries} onBack={() => setCurrentView('DASHBOARD')} />;
-      case 'SETTINGS': return <Settings settings={settings} onSave={handleSaveSettings} onBack={() => setCurrentView('DASHBOARD')} installPrompt={deferredPrompt} onInstall={handleInstallApp} onManageUsers={() => setCurrentView('USER_MANAGEMENT')} />;
+      case 'SETTINGS': return <Settings settings={settings} onSave={handleSaveSettings} onBack={() => setCurrentView('DASHBOARD')} installPrompt={deferredPrompt} onInstall={() => deferredPrompt.prompt()} onManageUsers={() => setCurrentView('USER_MANAGEMENT')} onSwitchUserRequest={() => setConfirmModal({ show: true, type: 'switch' })} onLogoutRequest={() => setConfirmModal({ show: true, type: 'logout' })} />;
       case 'USER_MANAGEMENT': return <UserManagement onBack={() => setCurrentView('DASHBOARD')} />;
       default: return <Dashboard onNewArrival={() => {}} activeCount={0} onViewActive={() => {}} onViewShift={() => {}} onViewMasterData={() => {}} onViewContacts={() => {}} onViewBreakfast={() => {}} onViewPackages={() => {}} onViewMeters={() => {}} onViewLogs={() => {}} onViewPatrols={() => {}} />;
     }
@@ -251,6 +280,17 @@ const App: React.FC = () => {
 
   return (
     <div className={`flex flex-col h-full max-w-4xl mx-auto shadow-xl bg-white dark:bg-slate-900 dark:border-slate-800 border-x transition-all duration-200 ${fontSizeClass}`}>
+      {confirmModal.show && (
+        <ConfirmHoldModal 
+          isOpen={confirmModal.show}
+          onClose={() => setConfirmModal({ ...confirmModal, show: false })}
+          onConfirm={confirmModal.type === 'switch' ? executeSwitchUser : executeLogoutAccount}
+          title={confirmModal.type === 'switch' ? "Trocar Usuário" : "Sair da Conta"}
+          description={confirmModal.type === 'switch' ? "Deseja voltar para a tela de login operacional?" : "A conta da empresa será desconectada deste dispositivo."}
+          color={confirmModal.type === 'logout' ? 'red' : 'blue'}
+        />
+      )}
+
       {!isOnline && (
         <div className="bg-red-600 text-white text-[10px] font-black uppercase tracking-widest py-1.5 text-center z-[100] shadow-md">
           ⚠️ MODO OFFLINE ATIVO • DADOS SEGUROS NO DISPOSITIVO
@@ -268,11 +308,6 @@ const App: React.FC = () => {
             </div>
           </div>
           <div className="flex items-center gap-3">
-             {internalUser?.role === 'admin' && (
-                <button onClick={() => setCurrentView('USER_MANAGEMENT')} className="bg-blue-600 hover:bg-blue-500 text-white p-2 rounded-lg transition-colors border border-blue-400/50 shadow-sm" title="Gerenciar Usuários">
-                  <Icons.Shield />
-                </button>
-             )}
              <div className="text-right">
                 <span className="text-[10px] text-slate-500 uppercase font-bold block leading-none mb-1">
                   {internalUser?.role === 'admin' ? '⭐ Administrador' : 'Porteiro'}
@@ -281,7 +316,7 @@ const App: React.FC = () => {
                   {internalUser?.username}
                 </span>
              </div>
-             <button onClick={handleSwitchUser} className="bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white p-2 rounded-lg transition-colors border border-red-900/50" title="Trocar Usuário">
+             <button onClick={() => setConfirmModal({ show: true, type: 'switch' })} className="bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white p-2 rounded-lg transition-colors border border-red-900/50" title="Trocar Usuário">
                <Icons.Logout />
              </button>
           </div>
